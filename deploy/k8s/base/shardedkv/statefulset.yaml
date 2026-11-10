@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: shardedkv
+  labels:
+    app: shardedkv
+spec:
+  serviceName: shardedkv-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: shardedkv
+  template:
+    metadata:
+      labels:
+        app: shardedkv
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: shardedkv
+          image: shardedkv:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GOMEMLIMIT
+              value: "410MiB"
+          args:
+            - "-eviction-policy=w-tinylfu"
+          ports:
+            - containerPort: 9000
+              name: grpc-client
+            - containerPort: 8080
+              name: http-mgmt
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 2

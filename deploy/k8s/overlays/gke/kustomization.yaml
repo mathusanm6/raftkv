@@ -1,0 +1,73 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base/postgres
+  - ../../base/raftkv
+  - ../../base/shardedkv
+  - ../../base/benchmark
+
+patches:
+  # GKE Pool Placement & SSD Disks for Postgres
+  - target:
+      kind: StatefulSet
+      name: postgres
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          cloud.google.com/gke-nodepool: pool-db
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/storageClassName
+        value: pd-ssd
+
+  # GKE Topology Spread & SSD Disks for RaftKV
+  - target:
+      kind: StatefulSet
+      name: raftkv
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          cloud.google.com/gke-nodepool: pool-cache
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app: raftkv
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/storageClassName
+        value: pd-ssd
+
+  # GKE Node Selector for ShardedKV
+  - target:
+      kind: StatefulSet
+      name: shardedkv
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          cloud.google.com/gke-nodepool: pool-cache
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app: shardedkv
+
+  # GKE Node Selector for Benchmark Load Generator
+  - target:
+      kind: Job
+      name: benchmark-loadgen
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          cloud.google.com/gke-nodepool: pool-loadgen
