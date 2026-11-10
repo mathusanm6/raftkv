@@ -1,0 +1,39 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: benchmark-loadgen
+  labels:
+    app: loadgen
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: loadgen:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-system=a"
+            - "-grpc-addrs=raftkv-0.raftkv-headless.default.svc.cluster.local:9000,raftkv-1.raftkv-headless.default.svc.cluster.local:9000,raftkv-2.raftkv-headless.default.svc.cluster.local:9000"
+            - "-http-addrs=raftkv-0.raftkv-headless.default.svc.cluster.local:8080,raftkv-1.raftkv-headless.default.svc.cluster.local:8080,raftkv-2.raftkv-headless.default.svc.cluster.local:8080"
+            - "-postgres-url=postgres://postgres:password@postgres:5432/raftkv?sslmode=disable"
+            - "-rate=1000"
+            - "-duration=15m"
+            - "-output-csv=/output/results.csv"
+          resources:
+            requests:
+              cpu: "2000m"
+              memory: "1Gi"
+            limits:
+              cpu: "6000m"
+              memory: "2Gi"
+          volumeMounts:
+            - name: output
+              mountPath: /output
+      volumes:
+        - name: output
+          emptyDir: {}

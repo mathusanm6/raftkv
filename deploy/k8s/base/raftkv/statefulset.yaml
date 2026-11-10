@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: raftkv
+  labels:
+    app: raftkv
+spec:
+  serviceName: raftkv-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: raftkv
+  template:
+    metadata:
+      labels:
+        app: raftkv
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: raftkv
+          image: raftkv:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GOMEMLIMIT
+              value: "410MiB"
+          args:
+            - "-peers=raftkv-0=raftkv-0.raftkv-headless.default.svc.cluster.local:9001=raftkv-0.raftkv-headless.default.svc.cluster.local:9000,raftkv-1=raftkv-1.raftkv-headless.default.svc.cluster.local:9001=raftkv-1.raftkv-headless.default.svc.cluster.local:9000,raftkv-2=raftkv-2.raftkv-headless.default.svc.cluster.local:9001=raftkv-2.raftkv-headless.default.svc.cluster.local:9000"
+            - "-data-dir=/data"
+            - "-eviction-policy=w-tinylfu"
+            - "-sync-on-append=true"
+          ports:
+            - containerPort: 9000
+              name: grpc-client
+            - containerPort: 9001
+              name: grpc-raft
+            - containerPort: 8080
+              name: http-mgmt
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
