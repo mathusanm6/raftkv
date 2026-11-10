@@ -65,6 +65,7 @@ type CacheAsideClient struct {
 	mu          sync.Mutex
 	pendingDels map[string]retryItem
 	stopCh      chan struct{}
+	closeOnce   sync.Once
 }
 
 // NewCacheAsideClient creates a CacheAsideClient.
@@ -258,6 +259,10 @@ func (c *CacheAsideClient) Metrics() ClientMetrics {
 
 // Close gracefully closes the client and shuts down retry workers.
 func (c *CacheAsideClient) Close() error {
-	close(c.stopCh)
-	return c.cache.Close()
+	var err error
+	c.closeOnce.Do(func() {
+		close(c.stopCh)
+		err = c.cache.Close()
+	})
+	return err
 }

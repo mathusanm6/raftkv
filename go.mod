@@ -1,16 +1,16 @@
 module github.com/mathusanm6/raftkv
 
-go 1.27.3
+go 1.26.0
 
 require (
 	github.com/jathurchan/raft v1.0.1-0.20261109145326-964ca59a41a8
+	github.com/lib/pq v1.12.3
 	github.com/stretchr/testify v1.12.1
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 )
 
 require (
-	github.com/lib/pq v1.12.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect

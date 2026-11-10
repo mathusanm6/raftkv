@@ -1,0 +1,19 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+    labels:
+      cloud.google.com/gke-nodepool: pool-cache
+  - role: worker
+    labels:
+      cloud.google.com/gke-nodepool: pool-cache
+  - role: worker
+    labels:
+      cloud.google.com/gke-nodepool: pool-cache
+  - role: worker
+    labels:
+      cloud.google.com/gke-nodepool: pool-db
+  - role: worker
+    labels:
+      cloud.google.com/gke-nodepool: pool-loadgen

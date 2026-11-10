@@ -63,7 +63,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize cache client: %v", err)
 	}
-	defer cacheClient.Close()
 
 	// 3. Cache-Aside Client
 	staleTracker := client.NewStaleTracker()
