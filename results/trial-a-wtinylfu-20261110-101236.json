@@ -1,0 +1,15 @@
+{
+  "system": "a",
+  "policy": "wtinylfu",
+  "rate": 500,
+  "killed_target": "raftkv-0",
+  "hr_base": 0.7773,
+  "q_base": 85.13,
+  "q_extra": 3302.53,
+  "q_extra_300": 3302.53,
+  "recovery_time_sec": 25,
+  "dip_hr10": 0.5693,
+  "dip_raw": 0.7773,
+  "peak_pg_qps": 410,
+  "total_stale_reads": 0
+}
