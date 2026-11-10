@@ -39,7 +39,8 @@ type RaftKVClient struct {
 	clients    map[string]raftkvv1.RaftKVClient
 	leaderAddr string
 
-	stopCh chan struct{}
+	stopCh    chan struct{}
+	closeOnce sync.Once
 }
 
 // NewRaftKVClient initializes a client for System A.
@@ -71,39 +72,32 @@ func NewRaftKVClient(grpcAddrs []string, httpAddrs []string) (*RaftKVClient, err
 }
 
 func (c *RaftKVClient) leaderPollLoop() {
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
-	httpClient := &http.Client{Timeout: 40 * time.Millisecond}
+	httpClient := &http.Client{Timeout: 100 * time.Millisecond}
 
 	for {
 		select {
 		case <-c.stopCh:
 			return
 		case <-ticker.C:
-			// If leader is empty, poll /status of all nodes
-			c.mu.RLock()
-			currentLeader := c.leaderAddr
-			c.mu.RUnlock()
-
-			if currentLeader == "" {
-				for _, httpAddr := range c.httpAddrs {
-					url := fmt.Sprintf("http://%s/status", httpAddr)
-					resp, err := httpClient.Get(url)
-					if err == nil && resp.StatusCode == http.StatusOK {
-						var st struct {
-							Role          string `json:"role"`
-							LeaderAddress string `json:"leader_address"`
-						}
-						if json.NewDecoder(resp.Body).Decode(&st) == nil && st.LeaderAddress != "" {
-							c.mu.Lock()
-							c.leaderAddr = st.LeaderAddress
-							c.mu.Unlock()
+			for _, httpAddr := range c.httpAddrs {
+				url := fmt.Sprintf("http://%s/status", httpAddr)
+				resp, err := httpClient.Get(url)
+				if err == nil && resp.StatusCode == http.StatusOK {
+					var st struct {
+						Role          string `json:"role"`
+						LeaderAddress string `json:"leader_address"`
+					}
+					if json.NewDecoder(resp.Body).Decode(&st) == nil && st.LeaderAddress != "" {
+						if st.Role == "leader" {
+							c.updateLeader(st.LeaderAddress)
 							_ = resp.Body.Close()
 							break
 						}
-						_ = resp.Body.Close()
 					}
+					_ = resp.Body.Close()
 				}
 			}
 		}
@@ -124,6 +118,25 @@ func (c *RaftKVClient) getClient() (raftkvv1.RaftKVClient, string) {
 		return cl, addr
 	}
 	return nil, ""
+}
+
+func (c *RaftKVClient) getClientByAddr(addr string) raftkvv1.RaftKVClient {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clients[addr]
+}
+
+func (c *RaftKVClient) reconnect(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if conn, ok := c.conns[addr]; ok {
+		_ = conn.Close()
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err == nil {
+		c.conns[addr] = conn
+		c.clients[addr] = raftkvv1.NewRaftKVClient(conn)
+	}
 }
 
 func (c *RaftKVClient) updateLeader(leaderAddr string) {
@@ -157,37 +170,74 @@ func extractLeaderHint(err error) string {
 	return ""
 }
 
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return true
+	}
+	return st.Code() == codes.Unavailable || st.Code() == codes.DeadlineExceeded || st.Code() == codes.Canceled
+}
+
 // Get performs a read request with follower redirection retry.
 func (c *RaftKVClient) Get(ctx context.Context, key string) (string, int64, bool, error) {
-	client, _ := c.getClient()
+	client, addr := c.getClient()
 	if client == nil {
 		return "", 0, false, ErrCacheUnavailable
 	}
 
 	resp, err := client.Get(ctx, &raftkvv1.GetRequest{Key: key})
-	if err != nil {
-		newLeader := extractLeaderHint(err)
-		if newLeader != "" {
-			c.updateLeader(newLeader)
-			// Retry once at the new leader within deadline
-			c.mu.RLock()
-			retryClient := c.clients[newLeader]
-			c.mu.RUnlock()
-			if retryClient != nil {
-				resp, err = retryClient.Get(ctx, &raftkvv1.GetRequest{Key: key})
+	if err == nil {
+		return resp.Value, resp.Version, resp.Found, nil
+	}
+
+	// 1. Follower redirection via LeaderHint
+	if newLeader := extractLeaderHint(err); newLeader != "" {
+		c.updateLeader(newLeader)
+		if retryClient := c.getClientByAddr(newLeader); retryClient != nil {
+			resp, err = retryClient.Get(ctx, &raftkvv1.GetRequest{Key: key})
+			if err == nil {
+				return resp.Value, resp.Version, resp.Found, nil
 			}
 		}
 	}
 
-	if err != nil {
-		return "", 0, false, err
+	// 2. Transport error: reconnect and failover across alternative nodes
+	if isTransportError(err) {
+		c.reconnect(addr)
+		for _, altAddr := range c.nodeAddrs {
+			if altAddr == addr {
+				continue
+			}
+			altClient := c.getClientByAddr(altAddr)
+			if altClient == nil {
+				continue
+			}
+			resp, err2 := altClient.Get(ctx, &raftkvv1.GetRequest{Key: key})
+			if err2 == nil {
+				c.updateLeader(altAddr)
+				return resp.Value, resp.Version, resp.Found, nil
+			}
+			if altLeader := extractLeaderHint(err2); altLeader != "" {
+				c.updateLeader(altLeader)
+				if retryLeader := c.getClientByAddr(altLeader); retryLeader != nil {
+					resp, err3 := retryLeader.Get(ctx, &raftkvv1.GetRequest{Key: key})
+					if err3 == nil {
+						return resp.Value, resp.Version, resp.Found, nil
+					}
+				}
+			}
+		}
 	}
-	return resp.Value, resp.Version, resp.Found, nil
+
+	return "", 0, false, err
 }
 
 // Set performs a write request with follower redirection retry.
 func (c *RaftKVClient) Set(ctx context.Context, key, value string, version int64) error {
-	client, _ := c.getClient()
+	client, addr := c.getClient()
 	if client == nil {
 		return ErrCacheUnavailable
 	}
@@ -197,28 +247,65 @@ func (c *RaftKVClient) Set(ctx context.Context, key, value string, version int64
 		Value:   value,
 		Version: version,
 	})
-	if err != nil {
-		newLeader := extractLeaderHint(err)
-		if newLeader != "" {
-			c.updateLeader(newLeader)
-			c.mu.RLock()
-			retryClient := c.clients[newLeader]
-			c.mu.RUnlock()
-			if retryClient != nil {
-				_, err = retryClient.Set(ctx, &raftkvv1.SetRequest{
-					Key:     key,
-					Value:   value,
-					Version: version,
-				})
+	if err == nil {
+		return nil
+	}
+
+	if newLeader := extractLeaderHint(err); newLeader != "" {
+		c.updateLeader(newLeader)
+		if retryClient := c.getClientByAddr(newLeader); retryClient != nil {
+			_, err = retryClient.Set(ctx, &raftkvv1.SetRequest{
+				Key:     key,
+				Value:   value,
+				Version: version,
+			})
+			if err == nil {
+				return nil
 			}
 		}
 	}
+
+	if isTransportError(err) {
+		c.reconnect(addr)
+		for _, altAddr := range c.nodeAddrs {
+			if altAddr == addr {
+				continue
+			}
+			altClient := c.getClientByAddr(altAddr)
+			if altClient == nil {
+				continue
+			}
+			_, err2 := altClient.Set(ctx, &raftkvv1.SetRequest{
+				Key:     key,
+				Value:   value,
+				Version: version,
+			})
+			if err2 == nil {
+				c.updateLeader(altAddr)
+				return nil
+			}
+			if altLeader := extractLeaderHint(err2); altLeader != "" {
+				c.updateLeader(altLeader)
+				if retryLeader := c.getClientByAddr(altLeader); retryLeader != nil {
+					_, err3 := retryLeader.Set(ctx, &raftkvv1.SetRequest{
+						Key:     key,
+						Value:   value,
+						Version: version,
+					})
+					if err3 == nil {
+						return nil
+					}
+				}
+			}
+		}
+	}
+
 	return err
 }
 
 // Delete performs an invalidation request with follower redirection retry.
 func (c *RaftKVClient) Delete(ctx context.Context, key string, version int64) error {
-	client, _ := c.getClient()
+	client, addr := c.getClient()
 	if client == nil {
 		return ErrCacheUnavailable
 	}
@@ -227,33 +314,70 @@ func (c *RaftKVClient) Delete(ctx context.Context, key string, version int64) er
 		Key:     key,
 		Version: version,
 	})
-	if err != nil {
-		newLeader := extractLeaderHint(err)
-		if newLeader != "" {
-			c.updateLeader(newLeader)
-			c.mu.RLock()
-			retryClient := c.clients[newLeader]
-			c.mu.RUnlock()
-			if retryClient != nil {
-				_, err = retryClient.Delete(ctx, &raftkvv1.DeleteRequest{
-					Key:     key,
-					Version: version,
-				})
+	if err == nil {
+		return nil
+	}
+
+	if newLeader := extractLeaderHint(err); newLeader != "" {
+		c.updateLeader(newLeader)
+		if retryClient := c.getClientByAddr(newLeader); retryClient != nil {
+			_, err = retryClient.Delete(ctx, &raftkvv1.DeleteRequest{
+				Key:     key,
+				Version: version,
+			})
+			if err == nil {
+				return nil
 			}
 		}
 	}
+
+	if isTransportError(err) {
+		c.reconnect(addr)
+		for _, altAddr := range c.nodeAddrs {
+			if altAddr == addr {
+				continue
+			}
+			altClient := c.getClientByAddr(altAddr)
+			if altClient == nil {
+				continue
+			}
+			_, err2 := altClient.Delete(ctx, &raftkvv1.DeleteRequest{
+				Key:     key,
+				Version: version,
+			})
+			if err2 == nil {
+				c.updateLeader(altAddr)
+				return nil
+			}
+			if altLeader := extractLeaderHint(err2); altLeader != "" {
+				c.updateLeader(altLeader)
+				if retryLeader := c.getClientByAddr(altLeader); retryLeader != nil {
+					_, err3 := retryLeader.Delete(ctx, &raftkvv1.DeleteRequest{
+						Key:     key,
+						Version: version,
+					})
+					if err3 == nil {
+						return nil
+					}
+				}
+			}
+		}
+	}
+
 	return err
 }
 
 // Close closes all client connections.
 func (c *RaftKVClient) Close() error {
-	close(c.stopCh)
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.closeOnce.Do(func() {
+		close(c.stopCh)
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	for _, conn := range c.conns {
-		_ = conn.Close()
-	}
+		for _, conn := range c.conns {
+			_ = conn.Close()
+		}
+	})
 	return nil
 }
 
