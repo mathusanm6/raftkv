@@ -35,13 +35,6 @@ The end-to-end suite settled whether the Raft library stays correct under failur
 
 **Decision needed.** Should PreVote stay off for the benchmark? It prevents unnecessary elections when a node rejoins, but adds a round trip to each election. *Recommendation:* keep it off for the main runs and test it in one extra sweep. Library fixes go upstream, because they improve Raft for every user and keep the benchmark measuring Raft rather than a workaround.
 
-**XYZ resume templates** (use only what the results support)
-
-- Quantified the failover trade-off between Raft-replicated and sharded caching, as measured by [X] vs. [Y] median extra PostgreSQL requests per node kill across [N] Kubernetes failure runs, by building `raftkv`, a sharded baseline, and an open-loop benchmark harness on an existing Raft library.
-- [Reduced/Increased] extra PostgreSQL requests during node failure by [X]%, as measured against an unreplicated baseline over [N] runs, by replicating cached state across 3 nodes.
-- Measured the steady-state cost of replication at [X] hit-ratio points and [Y] added PostgreSQL queries per second, as measured in [N] no-failure runs, by testing both systems under equal memory and identical Zipfian traffic.
-- Limited replicated eviction to [X]% of Raft log bytes, as measured across LRU, LFU, and W-TinyLFU runs, by batching leader-selected evictions through the log.
-
 ---
 
 ## Retrospective Findings & Future Direction (Multi-Raft)
