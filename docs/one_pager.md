@@ -42,3 +42,11 @@ The end-to-end suite settled whether the Raft library stays correct under failur
 - Measured the steady-state cost of replication at [X] hit-ratio points and [Y] added PostgreSQL queries per second, as measured in [N] no-failure runs, by testing both systems under equal memory and identical Zipfian traffic.
 - Limited replicated eviction to [X]% of Raft log bytes, as measured across LRU, LFU, and W-TinyLFU runs, by batching leader-selected evictions through the log.
 
+---
+
+## Retrospective Findings & Future Direction (Multi-Raft)
+
+- **Iso-Resource Kind Benchmark Findings:** Under identical 3-node hardware and 500 req/s open-loop Zipfian load, ShardedKV had ~31% lower peak failover database load (306 vs. 444 QPS) because node failure was localized to 1/3 of partitions, whereas RaftKV experienced a transient 100% election pause across all keys.
+- **Durability Guarantee:** RaftKV guaranteed 0 lost writes and 0 stale reads across all failure scenarios; ShardedKV permanently wiped all dirty/warm state on the crashed shard.
+- **Next Step (Multi-Raft):** Motivated combining both designs into a Multi-Raft architecture (partitioning data into multiple consensus groups) to achieve both 1/N localized failure blast radius and zero-loss consensus durability. Upstream changes in `github.com/jathurchan/raft` are required for multi-group gRPC multiplexing, shared WAL fsync, and centralized tick management.
+
