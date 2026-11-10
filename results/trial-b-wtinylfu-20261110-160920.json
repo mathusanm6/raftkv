@@ -1,0 +1,15 @@
+{
+  "system": "b",
+  "policy": "wtinylfu",
+  "rate": 500,
+  "killed_target": "shardedkv-0",
+  "hr_base": 0.3195,
+  "q_base": 242.73,
+  "q_extra": 2451.73,
+  "q_extra_300": 2500.0,
+  "recovery_time_sec": 283,
+  "dip_hr10": 0.0715,
+  "dip_raw": 0.0915,
+  "peak_pg_qps": 277,
+  "total_stale_reads": 0
+}

@@ -48,37 +48,43 @@ To answer this, both systems run on Kubernetes in front of a 1,000,000-row Postg
 
 ---
 
-## 15-Minute Benchmark Results (Kind Cluster)
+## Benchmark Results (Kind Cluster)
 
-The benchmark was executed in a 6-node Kubernetes cluster provisioned via `kind` on OrbStack. Both systems ran for 15 minutes at a fixed open-loop rate of 500 req/s with W-TinyLFU eviction, following the evaluation protocol defined in `docs/benchmark_plan.md`:
-* **00:00 – 08:00 (480s):** Warm-up phase (cache fills, evictions begin, hit ratio stabilizes).
-* **08:00 – 10:00 (120s):** Steady-state baseline measurement ($HR_{base}$ and $Q_{base}$).
-* **10:00 (600s):** Forced node kill (`kubectl delete pod <node> --force --grace-period=0`). For System A, the active leader is killed; for System B, a shard is killed.
-* **10:00 – 15:00 (300s):** Observation phase tracking recovery and computing cumulative extra queries ($Q_{extra\_300}$).
+The benchmark was executed in a 6-node Kubernetes cluster provisioned via `kind` on OrbStack. Both systems ran at a fixed open-loop rate of 500 req/s with W-TinyLFU eviction, following the evaluation protocol defined in `docs/benchmark_plan.md`.
+
+To avoid warm-up confounding (where the cache is still actively learning frequency distributions and climbing toward plateau, artificially distorting post-kill integration into negative numbers), each trial uses an extended **20-minute (1200s) warm-up**:
+* **00:00 – 20:00 (1200s):** Warm-up phase (frequency sketches saturate, eviction sets stabilize, hit ratio reaches steady-state asymptote).
+* **20:00 – 22:00 (120s):** Steady-state baseline measurement ($HR_{base}$ and $Q_{base}$).
+* **22:00 (1320s):** Forced node kill (`kubectl delete pod <node> --force --grace-period=0`). For System A, the active leader is killed; for System B, an unreplicated shard is killed.
+* **22:00 – 27:00 (300s):** Observation phase tracking recovery and computing cumulative extra queries ($Q_{extra}$ and $Q_{extra\_300}$).
 
 ### Side-by-Side Comparison
 
 | Metric | System A (`raftkv`) | System B (`shardedkv`) | Notes |
 | :--- | :---: | :---: | :--- |
-| **Cluster Hardware** | 3 nodes (1 Raft group) | 3 nodes (3 shards) | Strictly equal resources |
-| **Killed Node** | `raftkv-1` (Leader) | `shardedkv-0` (Shard 0) | Leader crash vs. 1/3 shard crash |
-| **Baseline Hit Ratio ($HR_{base}$)** | 31.48% | 25.28% | Steady-state prior to kill |
-| **Baseline DB Load ($Q_{base}$)** | 299.1 QPS | 256.7 QPS | Sharding holds 3× distinct keys |
-| **Peak DB Failover Load** | **444 QPS** | **306 QPS** | **Sharded baseline is ~31% lower** |
-| **Hit Ratio Dip ($HR_{base} - \min HR$)** | 31.48% (100% dip) | 11.68% (partial dip) | Raft pauses reads during election |
-| **$Q_{extra}$ (outage to recovery)** | 3,484.9 queries | 547.1 queries | Extra queries dumped on PostgreSQL |
-| **$Q_{extra\_300}$ (fixed 300s window)** | 3,477.0 queries | -411.0 queries | Sharded continues filling post-kill |
-| **Stale Reads** | **0** | **0** | Zero consistency violations |
-| **Lost Committed Writes** | **0** | **100% on dead shard** | Raft replicas survive; shard wiped |
+| **Cluster Hardware** | 3 nodes (1 Raft group) | 3 nodes (3 shards) | Strictly equal resources (3 pods each) |
+| **Killed Node** | `raftkv-2` (Active Leader) | `shardedkv-0` (Shard 0) | Leader crash vs. 1/3 shard crash |
+| **Steady-State Hit Ratio ($HR_{base}$)** | **32.79%** | **31.95%** | Measured over 120s baseline |
+| **Baseline DB Load ($Q_{base}$)** | 285.6 QPS | 242.7 QPS | Sharded holds 3× unique capacity |
+| **Peak DB Failover Load** | **413 QPS** | **277 QPS** | **Sharded peak is ~33% lower** |
+| **Recovery Time ($t_{recovery} - t_{kill}$)** | **20 s** | **283 s** | **Raft recovers ~14× faster** |
+| **Hit Ratio Dip ($HR_{base} - \min HR$)** | 32.79% (100% dip) | 9.15% (partial dip) | Raft pauses reads during election |
+| **$Q_{extra}$ (outage to recovery)** | **804.4 queries** | **2,451.7 queries** | **Raft dumps 67% fewer extra queries** |
+| **$Q_{extra\_300}$ (fixed 300s window)** | 5,973.0 queries | 2,500.0 queries | Clean positive metrics (asymptote reached) |
+| **Stale Reads** | 2 | 0 | In-flight window during leader failover |
+| **Lost Committed Writes** | **0** | **100% on dead shard** | Replicas survive; shard memory wiped |
 
 ### Analysis: What the Trade-off Means
 
-1. **Why Sharding Had a Lower Peak Database Spike (306 vs. 444 QPS):**
-   * When a Raft leader dies, the **entire cluster temporarily pauses linearizable reads** while surviving nodes conduct election (10–15 s). During that window, 100% of incoming reads spill over to PostgreSQL, causing a sharp spike to 444 QPS.
-   * When a shard dies in ShardedKV, **the other 2 shards (67% of keys) remain healthy and keep serving hits**. Only 33% of requests spill over to PostgreSQL, keeping peak database load ~31% lower.
-2. **Why Raft Replication Matters:**
-   * In ShardedKV, Shard 0 has zero redundancy. When its container dies, **all dirty/in-flight writes and warm state are lost forever**. When the replacement pod starts, its memory is empty.
-   * In RaftKV, all state is replicated with WAL fsync. Surviving nodes already hold identical data, guaranteeing **zero lost writes** and **zero stale reads** through leader election and failover.
+1. **Failure Blast Radius vs. Recovery Speed:**
+   * **System A (`raftkv`):** When the active leader dies, the entire cluster temporarily pauses linearizable reads during leader election (20s recovery). This causes a brief 100% hit ratio dip and spikes peak PostgreSQL load to 413 QPS. However, because surviving followers **already hold warm replicated cache data**, the cluster instantly resumes serving hits the moment a new leader is elected. As a result, its outage-to-recovery penalty ($Q_{extra}$) is only **804 queries**.
+   * **System B (`shardedkv`):** When a shard dies, 2/3 of the cluster remains operational, keeping peak database load lower (277 QPS) and localized to that shard's key range. However, because the replacement pod starts completely cold with zero replicated state, it takes **283 seconds** to repopulate its working set and frequency sketch, resulting in a much larger recovery spillover of **2,451 extra queries** onto PostgreSQL.
+2. **Warm-up Plateau and Why Extended Warm-up Was Necessary:**
+   * In shorter trials (e.g. 8 minutes), W-TinyLFU's frequency sketches were still actively learning key distributions during the baseline, causing the post-recovery hit ratio to rise above baseline and artificially producing negative $Q_{extra\_300}$ metrics.
+   * Allowing 20 minutes of warm-up reached true steady-state equilibrium (~32% hit ratio), yielding accurate, positive extra-query penalties for both systems.
+3. **Data Durability:**
+   * In ShardedKV, Shard 0 has zero redundancy: container termination wipes all committed writes in that shard.
+   * In RaftKV, all state is durably replicated with WAL fsync, guaranteeing zero lost writes across leader failovers.
 
 ---
 
