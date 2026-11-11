@@ -160,6 +160,17 @@ func (s *Store) ApplyEvict(items []*raftkvv1.EvictItem, applyIndex uint64) int {
 	return evicted
 }
 
+// AdvanceApplied records a log index whose command changes no cache data,
+// such as an ACCESS batch, so replay stays idempotent.
+func (s *Store) AdvanceApplied(applyIndex uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if applyIndex > s.lastApplied {
+		s.lastApplied = applyIndex
+	}
+}
+
 // LastApplied returns the highest log index applied to this store.
 func (s *Store) LastApplied() uint64 {
 	s.mu.RLock()

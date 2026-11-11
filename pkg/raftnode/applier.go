@@ -100,6 +100,17 @@ func (a *Applier) Apply(_ context.Context, index types.Index, command []byte) (a
 					a.eviction.Remove(item.Key)
 				}
 			}
+
+		case *raftkvv1.RaftCommand_Access:
+			a.store.AdvanceApplied(applyIdx)
+			applied = true
+			if a.eviction != nil {
+				for _, item := range p.Access.Items {
+					for i := uint32(0); i < item.Count; i++ {
+						a.eviction.RecordAccess(item.Key)
+					}
+				}
+			}
 		}
 	}
 

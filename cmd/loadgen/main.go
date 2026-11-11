@@ -104,14 +104,15 @@ func main() {
 		cancel()
 	}()
 
-	fmt.Printf("%-6s | %-8s | %-6s | %-6s | %-8s | %-8s | %-8s | %-8s\n",
-		"Sec", "Sent", "Hits", "Misses", "HR(t)", "HR10", "PG Qs", "Stale")
-	fmt.Println(strings.Repeat("-", 75))
+	fmt.Printf("%-6s | %-8s | %-6s | %-6s | %-8s | %-8s | %-8s | %-8s | %-8s | %-8s\n",
+		"Sec", "Sent", "Hits", "Misses", "HR(t)", "HR10", "PG Qs", "Stale", "StaleWin", "StaleAck")
+	fmt.Println(strings.Repeat("-", 97))
 
 	err = loadGen.Run(ctx, func(s client.PerSecondStats) {
-		fmt.Printf("%-6d | %-8d | %-6d | %-6d | %-8.3f | %-8.3f | %-8d | %-8d\n",
+		fmt.Printf("%-6d | %-8d | %-6d | %-6d | %-8.3f | %-8.3f | %-8d | %-8d | %-8d | %-8d\n",
 			s.ElapsedSeconds, s.RequestsSent, s.Hits, s.Misses, s.HitRatio, s.HR10,
-			s.PostgresQueries, s.StaleReadsInWindow+s.StaleReadsAfterAck)
+			s.PostgresQueries, s.StaleReadsInWindow+s.StaleReadsAfterAck,
+			s.StaleReadsInWindow, s.StaleReadsAfterAck)
 
 		if csvWriter != nil {
 			_ = csvWriter.Write([]string{

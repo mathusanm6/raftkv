@@ -81,6 +81,7 @@ func main() {
 		policyName   = flag.String("eviction-policy", "w-tinylfu", "Eviction policy: lru, lfu, or w-tinylfu")
 		logLevel     = flag.String("log-level", "info", "Log level: debug, info, warn, error")
 		syncOnAppend = flag.Bool("sync-on-append", true, "Force fsync on every log append")
+		replicate    = flag.Bool("replicate-access", true, "Replicate cache hits as ACCESS batches so a new leader keeps popularity data (design doc §7.6)")
 	)
 	flag.Parse()
 
@@ -90,7 +91,7 @@ func main() {
 	id := types.NodeID(*nodeIDStr)
 
 	lg := logger.NewStdLogger(*logLevel)
-	lg.Infow("Starting raftkv node", "nodeID", id, "policy", *policyName)
+	lg.Infow("Starting raftkv node", "nodeID", id, "policy", *policyName, "replicateAccess", *replicate)
 
 	raftPeers, peerInfos := parsePeers(*peersFlag)
 	if len(raftPeers) == 0 {
@@ -206,13 +207,25 @@ func main() {
 		}
 	}()
 
-	readCoalescer := raftnode.NewReadIndexCoalescer(node, store, coldStartPolicy)
+	// v2 (design doc §7.6): hits go through the log to every replica's policy.
+	// v1: hits update only the leader's policy, which is rebuilt on promotion.
+	var accessRecorder raftnode.AccessRecorder = coldStartPolicy
+	var accessReplicator *raftnode.AccessReplicator
+	if *replicate {
+		accessReplicator = raftnode.NewAccessReplicator(node)
+		accessRecorder = accessReplicator
+		go accessReplicator.Run()
+	}
+
+	readCoalescer := raftnode.NewReadIndexCoalescer(node, store, accessRecorder)
 	proposer := raftnode.NewProposalManager(node, store, applier, coldStartPolicy)
 
 	// 5. Monitor Leadership Changes
 	go func() {
 		for leaderID := range node.LeaderChangeChannel() {
-			if leaderID == id {
+			if leaderID == id && accessReplicator != nil {
+				lg.Infow("Became leader, keeping replicated popularity data", "nodeID", id)
+			} else if leaderID == id {
 				lg.Infow("Became leader, initializing cold-start warmup", "nodeID", id)
 				entries := store.Entries()
 				sort.Slice(entries, func(i, j int) bool {
@@ -225,6 +238,9 @@ func main() {
 				coldStartPolicy.StartColdStart(keys)
 			} else {
 				// Leadership lost: abort waiters
+				if accessReplicator != nil {
+					accessReplicator.Discard()
+				}
 				applier.AbortWaiters(raftnode.ErrNotLeader)
 				readCoalescer.AbortAll(raftnode.ErrNotLeader)
 			}
@@ -272,6 +288,9 @@ func main() {
 	defer shutdownCancel()
 
 	_ = httpServer.Shutdown(shutdownCtx)
+	if accessReplicator != nil {
+		accessReplicator.Stop()
+	}
 	readCoalescer.Stop()
 	_ = node.Stop(shutdownCtx)
 

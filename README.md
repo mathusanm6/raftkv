@@ -27,7 +27,7 @@ To answer this, both systems run on Kubernetes in front of a 1,000,000-row Postg
        |  - 102k key limit (1x cap)    |   |   - 308k key limit (3x cap)   |
        |  - Linearizable ReadIndex     |   |   - 256-vnode consistent ring |
        |  - Replicated batch eviction  |   |   - Local synchronous evict   |
-       |  - 4,096-entry tombstone ring |   |   - 4,096-entry tombstone ring|
+       |  - Replicated ACCESS counts   |   |   - 4,096-entry tombstone ring|
        +---------------+---------------+   +---------------+---------------+
                        |                                   |
                        +-----------------+-----------------+
@@ -41,68 +41,66 @@ To answer this, both systems run on Kubernetes in front of a 1,000,000-row Postg
 
 ### Core Design Principles
 1. **Deterministic Memory Accounting:** Exact 648 bytes per entry (`len(k) + len(v) + 72`). 557,056 bytes reserved upfront on each node for a 4,096-slot circular tombstone ring.
-2. **Pluggable Evictions:** Pluggable eviction interface supporting `LRU`, `LFU`, and `W-TinyLFU` (Window LRU + Count-Min Sketch frequency filter + SLRU). Eviction triggers at a 90% soft limit via replicated `EvictBatch` log entries; hard limit (100%) rejections occur strictly on the leader prior to consensus to ensure state-machine determinism.
+2. **Pluggable Evictions & Replicated Popularity (v2):** Pluggable eviction interface supporting `LRU`, `LFU`, and `W-TinyLFU` (Window LRU + Count-Min Sketch frequency filter + SLRU). Eviction triggers at a 90% soft limit via replicated `EvictBatch` log entries; hard limit (100%) rejections occur strictly on the leader prior to consensus. In **v2** (`-replicate-access=true`), the leader batches cache hits into a 1 s `ACCESS` log entry so all replicas maintain identical W-TinyLFU frequency sketches and SLRU segments across leader promotions (`docs/improvement_doc.md`).
 3. **Safe Tombstone Ring Wrap-around:** When the 4,096-slot tombstone ring overwrites `(oldKey, oldVersion)`, the map entry is only deleted if `map[oldKey] == oldVersion`, preventing double-delete bugs from erasing newer tombstones.
 4. **Linearizable Reads (`ReadIndex`):** Reads route through the Raft leader via `ReadIndex`, coalescing concurrent requests across heartbeats to avoid stale reads without disk I/O.
 5. **Open-Loop Cache-Aside Client:** Issues 50 ms timed reads, handles asynchronous backfills, retries failed invalidations every 200 ms for up to 5 seconds, and tracks stale reads under two categories: *in-window* (during retried invalidation) vs. *after-ack* (after invalidation succeeded).
 
 ---
 
-## Benchmark Results (Kind Cluster)
+## Benchmark Results (`kind` Cluster)
 
-The benchmark was executed in a 6-node Kubernetes cluster provisioned via `kind` on OrbStack. Both systems ran at a fixed open-loop rate of 500 req/s with W-TinyLFU eviction, following the evaluation protocol defined in `docs/benchmark_plan.md`.
+Both systems ran in a 6-node `kind` cluster at a fixed open-loop rate of 500 req/s (Zipf $s = 0.9$, 95% reads / 5% writes, W-TinyLFU eviction). Full plots and analysis are in [`benchmark_analysis.ipynb`](benchmark_analysis.ipynb) and [`docs/improvement_doc.md`](docs/improvement_doc.md).
 
-To avoid warm-up confounding (where the cache is still actively learning frequency distributions and climbing toward plateau, artificially distorting post-kill integration into negative numbers), each trial uses an extended **20-minute (1200s) warm-up**:
-* **00:00 – 20:00 (1200s):** Warm-up phase (frequency sketches saturate, eviction sets stabilize, hit ratio reaches steady-state asymptote).
-* **20:00 – 22:00 (120s):** Steady-state baseline measurement ($HR_{base}$ and $Q_{base}$).
-* **22:00 (1320s):** Forced node kill (`kubectl delete pod <node> --force --grace-period=0`). For System A, the active leader is killed; for System B, an unreplicated shard is killed.
-* **22:00 – 27:00 (300s):** Observation phase tracking recovery and computing cumulative extra queries ($Q_{extra}$ and $Q_{extra\_300}$).
+Each trial uses a **20-minute (1200 s) warm-up** so W-TinyLFU frequency sketches and working sets stabilize before measurement:
+* **`0..1200s` (1200 s):** Warm-up phase.
+* **`1200..1320s` (120 s):** Pre-crash baseline measurement ($Q_{base}$ and $HR_{base}$).
+* **`t = 0` (`1320s`):** Forced pod kill (`kubectl delete pod <target> --force --grace-period=0`) — active leader for RaftKV, `shardedkv-0` for ShardedKV.
+* **`t = 0..300s` (300 s):** Post-crash observation window measuring cumulative extra PostgreSQL queries above baseline ($Q_{extra\_300} = \sum_{t=0}^{300} (Q(t) - Q_{base})$).
 
-### Side-by-Side Comparison
+### 3-Way Comparison: RaftKV v1 vs. RaftKV v2 vs. ShardedKV
 
-| Metric | System A (`raftkv`) | System B (`shardedkv`) | Notes |
-| :--- | :---: | :---: | :--- |
-| **Cluster Hardware** | 3 nodes (1 Raft group) | 3 nodes (3 shards) | Strictly equal resources (3 pods each) |
-| **Killed Node** | `raftkv-2` (Active Leader) | `shardedkv-0` (Shard 0) | Leader crash vs. 1/3 shard crash |
-| **Steady-State Hit Ratio ($HR_{base}$)** | **32.79%** | **31.95%** | Measured over 120s baseline |
-| **Baseline DB Load ($Q_{base}$)** | 285.6 QPS | 242.7 QPS | Sharded holds 3× unique capacity |
-| **Peak DB Failover Load** | **413 QPS** | **277 QPS** | **Sharded peak is ~33% lower** |
-| **Recovery Time ($t_{recovery} - t_{kill}$)** | **20 s** | **283 s** | **Raft recovers ~14× faster** |
-| **Hit Ratio Dip ($HR_{base} - \min HR$)** | 32.79% (100% dip) | 9.15% (partial dip) | Raft pauses reads during election |
-| **$Q_{extra}$ (outage to recovery)** | **804.4 queries** | **2,451.7 queries** | **Raft dumps 67% fewer extra queries** |
-| **$Q_{extra\_300}$ (fixed 300s window)** | 5,973.0 queries | 2,500.0 queries | Clean positive metrics (asymptote reached) |
-| **Stale Reads** | 2 | 0 | In-flight window during leader failover |
-| **Lost Committed Writes** | **0** | **100% on dead shard** | Replicas survive; shard memory wiped |
+| Metric | RaftKV v1 (policy reset) | RaftKV v2 (replicated counters) | ShardedKV (1 shard killed) |
+| :--- | :---: | :---: | :---: |
+| **Cluster Topology** | 3 nodes (1 Raft group) | 3 nodes (1 Raft group) | 3 nodes (3 independent shards) |
+| **Eviction State on Promotion** | Reset (`ColdStartWrapper`) | Replicated (`ACCESS` 1 s batch) | N/A (restarted shard is empty) |
+| **Killed Target** | `raftkv-2` (leader) | `raftkv-1` (leader) | `shardedkv-0` (1/3 keys) |
+| **Baseline PostgreSQL QPS ($Q_{base}$)** | 286/s | 282/s | **241/s** |
+| **Baseline Hit Ratio ($HR_{base}$)** | 0.328 | 0.353 | 0.318 |
+| **Peak PostgreSQL QPS** | 413/s | 454/s | **291/s** |
+| **Lowest `HR10` (`10s` moving avg)** | 0.022 | 0.139 | **0.254** |
+| **Extra Queries, Election (`t = 0–12s`)** | 784 | 775 | **205** |
+| **Mean Excess QPS (`t = 30–300s`)** | +18.7/s | **+10.5/s** (−44%) | **+8.6/s** |
+| **$Q_{extra\_300}$ (`t = 0–300s` total)** | 5,973 | **3,514** (−41%) | **2,871** |
+| **Stale Reads (`in-window / after-ack`)** | 2 (total) | **0 / 0** | **0 / 0** |
 
-### Analysis: What the Trade-off Means
+### Findings
 
-1. **Failure Blast Radius vs. Recovery Speed:**
-   * **System A (`raftkv`):** When the active leader dies, the entire cluster temporarily pauses linearizable reads during leader election (20s recovery). This causes a brief 100% hit ratio dip and spikes peak PostgreSQL load to 413 QPS. However, because surviving followers **already hold warm replicated cache data**, the cluster instantly resumes serving hits the moment a new leader is elected. As a result, its outage-to-recovery penalty ($Q_{extra}$) is only **804 queries**.
-   * **System B (`shardedkv`):** When a shard dies, 2/3 of the cluster remains operational, keeping peak database load lower (277 QPS) and localized to that shard's key range. However, because the replacement pod starts completely cold with zero replicated state, it takes **283 seconds** to repopulate its working set and frequency sketch, resulting in a much larger recovery spillover of **2,451 extra queries** onto PostgreSQL.
-2. **Warm-up Plateau and Why Extended Warm-up Was Necessary:**
-   * In shorter trials (e.g. 8 minutes), W-TinyLFU's frequency sketches were still actively learning key distributions during the baseline, causing the post-recovery hit ratio to rise above baseline and artificially producing negative $Q_{extra\_300}$ metrics.
-   * Allowing 20 minutes of warm-up reached true steady-state equilibrium (~32% hit ratio), yielding accurate, positive extra-query penalties for both systems.
-3. **Data Durability:**
-   * In ShardedKV, Shard 0 has zero redundancy: container termination wipes all committed writes in that shard.
-   * In RaftKV, all state is durably replicated with WAL fsync, guaranteeing zero lost writes across leader failovers.
+1. **In v1, resetting W-TinyLFU cost more than the election itself (87% of $Q_{extra\_300}$):**
+   * The leader election (`t = 0–12s`) blocked `ReadIndex` and added **784** extra PostgreSQL queries.
+   * After `t = 12s`, the new leader held every cached key in memory, yet PostgreSQL remained **+18.7 QPS** above baseline for the entire 300 s window (**~5,189** extra queries). Because W-TinyLFU counters were node-local in v1, the new leader reset its policy on promotion (`docs/design_doc.md` §7.6) and evicted hot keys while rebuilding its frequency sketch.
+   * Note: $t_{recovery}$ (`0.95 × HR_base`) is not a reliable metric at low hit ratios (~0.32) because the threshold sits inside normal $\pm 0.016$ variance; `HR10` crosses it within 20 s while PostgreSQL load remains elevated. $Q_{extra\_300}$ measures true database cost.
+2. **Replicating hit counts in v2 cut RaftKV's failover cost by 41%:**
+   * Batching leader cache hits into 1 s `ACCESS` Raft log entries (~6% extra log bytes) keeps every follower's frequency sketch and SLRU segments identical to the leader's.
+   * On promotion, the new leader keeps its W-TinyLFU state: post-election excess dropped from **+18.7/s to +10.5/s (−44%)**, and $Q_{extra\_300}$ fell from **5,973 to 3,514**.
+   * Election cost (`t = 0–12s`) remained unchanged (**775** vs. **784** extra queries), as it is governed by Raft election timers (`5–9s` outage), not eviction policy.
+3. **ShardedKV still wins in both steady state and failover:**
+   * **Steady state:** ShardedKV sends **~40 fewer queries/s** to PostgreSQL (`241/s` vs. `282–286/s`) because partitioning across 3 nodes gives 3× the unique cache capacity of a 3-replica Raft group.
+   * **Failover:** Killing one shard loses only 1/3 of cached keys with zero election stall, peaking at **291/s** (vs. **413–454/s** in RaftKV) and accumulating **2,871** extra queries over 300 s (vs. **3,514** in RaftKV v2).
+4. **Stale reads:**
+   * v1 recorded 2 stale reads at `t = +11s` (the first second the new leader served reads, while failed `DELETE` invalidations from the election window were still queued for client retry). v2 and ShardedKV recorded `0 / 0`.
 
 ---
 
 ## Next Steps
 
-### 1. Full Production Campaign on GKE
-Development and initial verification were conducted in `kind`. The full 173-run experimental matrix (testing LRU, LFU, W-TinyLFU across varying election timeout ranges and popularity resets per `docs/benchmark_plan.md` §5) will be run on Google Kubernetes Engine (GKE) across dedicated node pools:
-* `pool-cache`: 3 × `e2-standard-4` (100 GB `pd-ssd`, topology spread across zones)
-* `pool-db`: 1 × `e2-standard-4` (200 GB `pd-ssd`, PostgreSQL 16)
-* `pool-loadgen`: 1 × `e2-standard-8` (100 GB `pd-standard`)
+### 1. Experimental Controls & GKE Campaign
+* **Same-day A/B & No-Failure Controls:** Run `-replicate-access=false` vs. `true` back-to-back on the fixed harness clock, plus no-failure control trials to separate workload drift from post-crash excess (`docs/improvement_doc.md` §7).
+* **GKE Production Campaign:** Execute repeated trials ($n = 20$) across dedicated GKE node pools (`pool-cache`: 3 × `e2-standard-4`, `pool-db`: 1 × `e2-standard-4`, `pool-loadgen`: 1 × `e2-standard-8`) per `docs/benchmark_plan.md`.
 
-### 2. Multi-Raft Architecture (Combining Both Worlds)
-The empirical results prove that neither pure 3-replica Raft (high election spike) nor pure unreplicated sharding (zero write durability) is optimal on its own.
-
-The natural evolution is **Multi-Raft** (similar to CockroachDB and TiKV):
-* Partition the keyspace into 3 distinct consensus groups across the cluster nodes.
-* Each partition runs as its own independent Raft group with its own quorum.
-* **The result:** When a node crashes, only the partition group whose leader was on that node undergoes election (a localized 1/3 blast radius), while all committed writes within that partition remain durable and consistent across surviving replicas.
+### 2. Multi-Raft Architecture (Combining Capacity + Warm Failover)
+Full-cluster Raft replication trades away 2/3 of cache capacity and stalls 100% of reads during leader election. **Multi-Raft** (sharding the keyspace across multiple per-shard Raft groups) combines both advantages:
+* Partition capacity scales with node count, and a node failure triggers an election on only $1/N$ of the keyspace while surviving followers in that shard preserve both cached keys and replicated W-TinyLFU state.
 
 ### 3. Upstream Changes Required in `github.com/jathurchan/raft`
 To support a high-performance Multi-Raft architecture cleanly without running redundant resources, the following upstream additions are required in the underlying Raft library:
@@ -117,19 +115,20 @@ To support a high-performance Multi-Raft architecture cleanly without running re
 ```
 .
 ├── bench/                  # Automated failure benchmark runner (run_trial.py)
+├── benchmark_analysis.ipynb# Failover comparison notebook (RaftKV v1, v2, ShardedKV)
 ├── cmd/
 │   ├── loadgen/            # Open-loop Zipfian benchmark load generator
 │   ├── raftkv/             # RaftKV cache service daemon
 │   └── shardedkv/          # ShardedKV baseline daemon
 ├── deploy/
 │   └── k8s/                # Base manifests and overlays (kind, gke)
-├── docs/                   # Benchmark plan, design doc, and one-pager
+├── docs/                   # Benchmark plan, design doc, improvement doc, and one-pager
 ├── pkg/
 │   ├── cache/              # Core store, 648B accounting, circular tombstone ring
 │   ├── client/             # Cache-aside client, stale tracker, consistent routing
 │   ├── eviction/           # LRU, LFU, W-TinyLFU, and cold-start wrapper
 │   ├── hashring/           # 256-vnode consistent hash ring
-│   ├── raftnode/           # Raft applier, read-index coalescer, proposal manager
+│   ├── raftnode/           # Raft applier, read-index coalescer, access replicator
 │   ├── server/             # gRPC and HTTP status/management endpoints
 │   └── shardedkv/          # Unreplicated shard engine
 └── test/                   # Live 3-node cluster failover e2e test
@@ -155,10 +154,10 @@ go test -v -race ./test/...
 
 ### 2. Run Single Benchmark Trial in Kind
 ```bash
-# Test drive System A (RaftKV) with leader failure
-python3 bench/run_trial.py --system a --policy wtinylfu --rate 500 --warmup-sec 60 --baseline-sec 30 --observe-sec 60
+# Run System A (RaftKV v2, replicated access counts enabled by default)
+python3 bench/run_trial.py --system a --policy wtinylfu --rate 500 --warmup-sec 1200 --baseline-sec 120 --observe-sec 300
 
-# Test drive System B (ShardedKV) with shard failure
-python3 bench/run_trial.py --system b --policy wtinylfu --rate 500 --warmup-sec 60 --baseline-sec 30 --observe-sec 60
+# Run System B (ShardedKV)
+python3 bench/run_trial.py --system b --policy wtinylfu --rate 500 --warmup-sec 1200 --baseline-sec 120 --observe-sec 300
 ```
 Per-second metrics and trial summary JSONs are saved directly to `results/`.
