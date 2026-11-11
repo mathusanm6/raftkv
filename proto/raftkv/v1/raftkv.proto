@@ -49,6 +49,7 @@ message RaftCommand {
     SetCommand set = 2;
     DeleteCommand delete = 3;
     EvictBatchCommand evict = 4;
+    AccessBatchCommand access = 5;
   }
 }
 
@@ -70,6 +71,18 @@ message EvictItem {
 
 message EvictBatchCommand {
   repeated EvictItem items = 1;
+}
+
+// AccessItem is a key and the number of cache hits the leader saw for it.
+message AccessItem {
+  string key = 1;
+  uint32 count = 2;
+}
+
+// AccessBatchCommand replicates leader-observed hits so every replica's
+// eviction policy keeps the same popularity data.
+message AccessBatchCommand {
+  repeated AccessItem items = 1;
 }
 
 // SnapshotData represents the full serializable state of the cache for Raft compaction.

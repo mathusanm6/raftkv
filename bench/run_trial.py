@@ -118,8 +118,19 @@ def execute_trial(args):
     run_cmd(f"kubectl wait --for=condition=Ready pod/{trial_name} -n {namespace} --timeout=30s")
     print(f"[✓] Benchmark runner {trial_name} is RUNNING.")
 
-    # 4. Monitor until kill time
-    start_time = time.time()
+    # 4. Monitor until kill time. The clock starts at the load generator's first
+    # stats row, not at pod readiness: its startup can lag by ~10 s, which once
+    # moved the kill into the baseline window (docs/improvement_doc.md §4.2).
+    start_time = None
+    for _ in range(240):
+        logs = run_cmd(f"kubectl logs {trial_name} -n {namespace}", check=False)
+        if any(line.split("|")[0].strip() == "1" for line in logs.splitlines() if "|" in line):
+            start_time = time.time() - 1.0
+            break
+        time.sleep(0.25)
+    if start_time is None:
+        raise RuntimeError("Load generator did not report its first second within 60 s")
+    print(f"[✓] Load generator clock synchronised (sec 1 observed).")
     killed = False
     killed_target = ""
 
@@ -195,9 +206,13 @@ def execute_trial(args):
                 hr10 = float(parts[5])
                 pg_qs = int(parts[6])
                 stale = int(parts[7])
+                # Older load generators print only the combined stale count.
+                stale_window = int(parts[8]) if len(parts) >= 10 else 0
+                stale_after_ack = int(parts[9]) if len(parts) >= 10 else 0
                 records.append({
                     "sec": sec, "sent": sent, "hits": hits, "misses": misses,
-                    "hrt": hrt, "hr10": hr10, "pg_qs": pg_qs, "stale": stale
+                    "hrt": hrt, "hr10": hr10, "pg_qs": pg_qs, "stale": stale,
+                    "stale_window": stale_window, "stale_after_ack": stale_after_ack
                 })
             except ValueError:
                 continue
@@ -211,7 +226,7 @@ def execute_trial(args):
 
     # Write records to CSV
     with open(csv_file, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["sec", "sent", "hits", "misses", "hrt", "hr10", "pg_qs", "stale"])
+        writer = csv.DictWriter(f, fieldnames=["sec", "sent", "hits", "misses", "hrt", "hr10", "pg_qs", "stale", "stale_window", "stale_after_ack"])
         writer.writeheader()
         writer.writerows(records)
     print(f"[✓] Saved per-second metrics to {csv_file}")
@@ -254,6 +269,8 @@ def execute_trial(args):
     dip_raw = max(0.0, hr_base - min_hrt_post)
     peak_pg_qps = max(r["pg_qs"] for r in post_kill_records) if post_kill_records else 0
     total_stale = sum(r["stale"] for r in records)
+    total_stale_window = sum(r["stale_window"] for r in records)
+    total_stale_after_ack = sum(r["stale_after_ack"] for r in records)
 
     metrics = {
         "system": system,
@@ -269,6 +286,8 @@ def execute_trial(args):
         "dip_raw": round(dip_raw, 4),
         "peak_pg_qps": peak_pg_qps,
         "total_stale_reads": total_stale,
+        "stale_reads_in_window": total_stale_window,
+        "stale_reads_after_ack": total_stale_after_ack,
     }
 
     with open(json_file, "w") as f:
@@ -286,7 +305,8 @@ def execute_trial(args):
     print(f"  Hit Ratio Dip (HR10):  {metrics['dip_hr10'] * 100:.2f}%")
     print(f"  Raw Dip (HR(t)):       {metrics['dip_raw'] * 100:.2f}%")
     print(f"  Peak Postgres QPS:     {metrics['peak_pg_qps']} qps")
-    print(f"  Stale Reads:           {metrics['total_stale_reads']}")
+    print(f"  Stale Reads:           {metrics['total_stale_reads']} "
+          f"(in window {metrics['stale_reads_in_window']}, after ack {metrics['stale_reads_after_ack']})")
     print("=" * 80 + "\n")
 
     return metrics

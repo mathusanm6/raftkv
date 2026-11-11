@@ -8,7 +8,6 @@ import (
 
 	"github.com/jathurchan/raft/raft"
 	"github.com/mathusanm6/raftkv/pkg/cache"
-	"github.com/mathusanm6/raftkv/pkg/eviction"
 )
 
 // ReadRequest encapsulates a client read query awaiting linearizable verification.
@@ -26,6 +25,12 @@ type ReadResponse struct {
 	Err     error
 }
 
+// AccessRecorder receives cache hits served by the leader. It is either the
+// eviction policy itself (v1) or an AccessReplicator (v2, design doc §7.6).
+type AccessRecorder interface {
+	RecordAccess(key string)
+}
+
 // ReadIndexCoalescer groups concurrent reads into single ReadIndex rounds.
 // If a round is in flight, new arrivals join the next round.
 type ReadIndexCoalescer struct {
@@ -33,7 +38,7 @@ type ReadIndexCoalescer struct {
 
 	node     raft.Raft
 	store    *cache.Store
-	eviction eviction.Policy
+	eviction AccessRecorder
 
 	activeRound   []*ReadRequest
 	nextRound     []*ReadRequest
@@ -43,7 +48,7 @@ type ReadIndexCoalescer struct {
 }
 
 // NewReadIndexCoalescer creates a new ReadIndexCoalescer.
-func NewReadIndexCoalescer(node raft.Raft, store *cache.Store, policy eviction.Policy) *ReadIndexCoalescer {
+func NewReadIndexCoalescer(node raft.Raft, store *cache.Store, policy AccessRecorder) *ReadIndexCoalescer {
 	return &ReadIndexCoalescer{
 		node:     node,
 		store:    store,
